@@ -1,7 +1,16 @@
+#!/bin/bash 
 # generate a portable compiled netbox-agent 
-DOCKER_BUILDKIT=1 \
-docker buildx build \
-  --progress=plain \
-  --output type=local,dest=. \
-  --builder default \
-  . -f docker/Dockerfile
+
+for PLATFORM in linux/amd64 linux/arm64
+do
+read -n1 -p "do you wish to try build ${PLATFORM} binary? (y = yes) " -r approval
+echo
+if [[ "$approval" =~ [Yy] ]]
+ then
+ echo "🚀 OK"
+ DOCKER_BUILDKIT=1 docker buildx build --progress=plain --output type=local,dest=. --builder default --platform ${PLATFORM} . -f docker/Dockerfile
+else
+ echo "❌ User Aborted build for ${PLATFORM} "
+fi
+
+done

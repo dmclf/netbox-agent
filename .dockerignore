@@ -1,0 +1,5 @@
+*
+!docker/
+!pyproject.toml
+!requirements.txt
+!netbox_agent/

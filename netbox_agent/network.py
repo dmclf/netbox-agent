@@ -488,6 +488,14 @@ class Network(object):
                         ip=netbox_ip.address,
                     )
                 )
+            # NetBox >= 4.x does not allow reassignment of an IP address
+            # while it is designated as the primary IP of the parent object.
+            if getattr(netbox_ip, "is_primary", False):
+                logging.debug(
+                    "Skipping reassignment of primary IP %s to avoid NetBox invariant violation",
+                    netbox_ip.address,
+                )
+                return netbox_ip
             else:
                 return netbox_ip
 
