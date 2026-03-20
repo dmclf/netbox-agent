@@ -1,0 +1,102 @@
+diff --git a/netbox_agent/network.py b/netbox_agent/network.py
+index c270610..cd1f371 100644
+--- a/netbox_agent/network.py
++++ b/netbox_agent/network.py
+@@ -141,11 +141,28 @@ class Network(object):
+         for nic in bonding_nics:
+             bond_int = self.get_netbox_network_card(nic)
+             logging.debug("Setting slave interface for {name}".format(name=bond_int.name))
++
++            # avoid crashing patch #1 
++            if bond_int is None:
++                logging.warning(
++                    "Bond interface %s not found in NetBox, skipping bonding setup",
++                    nic.get("name"),
++                )
++                continue
++
+             for slave_int in (
+                 self.get_netbox_network_card(slave_nic)
+                 for slave_nic in self.nics
+                 if slave_nic["name"] in nic["bonding_slaves"]
+             ):
++
++                # avoid crashing patch #2
++                if slave_int is None:
++                    logging.warning(
++                        "Bond slave interface not found in NetBox, skipping slave assignment"
++                    )
++                    continue
++
+                 if slave_int.lag is None or slave_int.lag.id != bond_int.id:
+                     logging.debug(
+                         "Settting interface {name} as slave of {master}".format(
+@@ -291,6 +308,16 @@ class Network(object):
+         return update, interface
+ 
+     def update_interface_macs(self, nic, macs):
++        # NetBox >= 4.x exposes MACAddress only via DCIM.
++        # There is no /api/virtualization/mac-addresses/ endpoint.
++        # Skip MAC object syncing for virtual machines to avoid hard failure.
++        if self.get_network_type() == "virtual":
++            logging.debug(
++                "Skipping MAC address object sync for virtual machine interface %s",
++                nic.name,
++            )
++            return
++
+         nb_macs = list(self.nb_net.mac_addresses.filter(interface_id=nic.id))
+         # Clean
+         for nb_mac in nb_macs:
+@@ -337,7 +364,25 @@ class Network(object):
+         if nic.get("ethtool") and nic["ethtool"].get("link") == "no":
+             params["enabled"] = False
+ 
+-        interface = self.nb_net.interfaces.create(**params)
++        # avoid crashing patch #3
++        # interface = self.nb_net.interfaces.create(**params)
++        try:
++            interface = self.nb_net.interfaces.create(**params)
++        except Exception as exc:
++            msg = str(exc)
++            if "Interface with this Device and Name already exists" in msg:
++                logging.debug(
++                    "Interface %s already exists on device %s, re-fetching",
++                    nic["name"],
++                    self.device.name,
++                )
++                interface = self.nb_net.interfaces.get(
++                    device_id=self.device.id,
++                    name=nic["name"],
++                )
++            else:
++                raise
++
+ 
+         if nic["vlan"]:
+             nb_vlan = self.get_or_create_vlan(nic["vlan"])
+diff --git a/netbox_agent/virtualmachine.py b/netbox_agent/virtualmachine.py
+index 00fa5cc..ae2a027 100644
+--- a/netbox_agent/virtualmachine.py
++++ b/netbox_agent/virtualmachine.py
+@@ -124,9 +124,17 @@ class VirtualMachine(object):
+             if vm.memory != memory:
+                 vm.memory = memory
+                 updated += 1
+-            if vm.disk != disk:
+-                vm.disk = disk
+-                updated += 1
++            #if vm.disk != disk:
++            #    vm.disk = disk
++            #    updated += 1
++            # NetBox >= 4.x enforces that vm.disk must equal the sum of VirtualDisk sizes.
++            # Since netbox-agent does not manage VirtualDisk objects, updating vm.disk
++            # can cause NetBox to reject the PATCH. Skip disk updates for existing VMs.
++            logging.debug(
++                "Skipping vm.disk update for existing virtual machine to avoid "
++                "virtual disk size mismatch"
++            )
++
+ 
+             vm_tags = sorted(set([x.name for x in vm.tags]))
+             tags = sorted(set(self.tags))
