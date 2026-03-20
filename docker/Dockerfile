@@ -1,8 +1,8 @@
 # base image of ubuntu:18.04 due to environment with older machines 
 # and easier to just have a single supported binary.
-ARG TARGETARCH
+ARG TARGETARCH UBUNTU_IMAGE=ubuntu:18.04
 
-FROM ${TARGETARCH}/ubuntu:18.04 AS builder
+FROM ${UBUNTU_IMAGE} AS builder
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \

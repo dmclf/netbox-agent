@@ -1,5 +1,18 @@
-#!/bin/bash 
-# generate a portable compiled netbox-agent 
+#!/usr/bin/env bash
+# generate a portable compiled netbox-agent
+
+set -e
+arch=$(uname -m)
+if [ "$arch" = "x86_64" ]; then
+  echo "Native amd64 detected; installing arm64 binfmt"
+  docker run --privileged --rm tonistiigi/binfmt --install arm64
+elif [ "$arch" = "aarch64" ]; then
+  echo "Native arm64 detected; installing amd64 binfmt"
+  docker run --privileged --rm tonistiigi/binfmt --install amd64
+else
+  echo "Unknown architecture: $arch"
+  exit 1
+fi
 
 for PLATFORM in linux/amd64 linux/arm64
 do
@@ -8,9 +21,22 @@ echo
 if [[ "$approval" =~ [Yy] ]]
  then
  echo "🚀 OK"
- DOCKER_BUILDKIT=1 docker buildx build --progress=plain --output type=local,dest=. --builder default --platform ${PLATFORM} . -f docker/Dockerfile
+ if [[ "$PLATFORM" = "linux/arm64" ]]
+ then
+  UBUNTU_IMAGE=arm64v8/ubuntu:18.04
+ else 
+  UBUNTU_IMAGE=ubuntu:18.04
+ fi
+ docker buildx ls | grep multiarch || docker buildx create --use --name multiarch
+ DOCKER_BUILDKIT=1 docker buildx build --progress=plain --output type=local,dest=. \
+    --builder multiarch --build-arg UBUNTU_IMAGE=${UBUNTU_IMAGE} --platform ${PLATFORM} . -f docker/Dockerfile
 else
  echo "❌ User Aborted build for ${PLATFORM} "
 fi
-
 done
+
+read -n1 -p "do you wish to remove the multiarch buildx builder ? (y = yes) " -r approval
+if [[ "$approval" =~ [Yy] ]]
+then
+ docker buildx rm multiarch
+fi
