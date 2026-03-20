@@ -124,9 +124,17 @@ class VirtualMachine(object):
             if vm.memory != memory:
                 vm.memory = memory
                 updated += 1
-            if vm.disk != disk:
-                vm.disk = disk
-                updated += 1
+            #if vm.disk != disk:
+            #    vm.disk = disk
+            #    updated += 1
+            # NetBox >= 4.x enforces that vm.disk must equal the sum of VirtualDisk sizes.
+            # Since netbox-agent does not manage VirtualDisk objects, updating vm.disk
+            # can cause NetBox to reject the PATCH. Skip disk updates for existing VMs.
+            logging.debug(
+                "Skipping vm.disk update for existing virtual machine to avoid "
+                "virtual disk size mismatch"
+            )
+
 
             vm_tags = sorted(set([x.name for x in vm.tags]))
             tags = sorted(set(self.tags))

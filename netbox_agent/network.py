@@ -141,11 +141,28 @@ class Network(object):
         for nic in bonding_nics:
             bond_int = self.get_netbox_network_card(nic)
             logging.debug("Setting slave interface for {name}".format(name=bond_int.name))
+
+            # avoid crashing patch #1 
+            if bond_int is None:
+                logging.warning(
+                    "Bond interface %s not found in NetBox, skipping bonding setup",
+                    nic.get("name"),
+                )
+                continue
+
             for slave_int in (
                 self.get_netbox_network_card(slave_nic)
                 for slave_nic in self.nics
                 if slave_nic["name"] in nic["bonding_slaves"]
             ):
+
+                # avoid crashing patch #2
+                if slave_int is None:
+                    logging.warning(
+                        "Bond slave interface not found in NetBox, skipping slave assignment"
+                    )
+                    continue
+
                 if slave_int.lag is None or slave_int.lag.id != bond_int.id:
                     logging.debug(
                         "Settting interface {name} as slave of {master}".format(
@@ -291,6 +308,16 @@ class Network(object):
         return update, interface
 
     def update_interface_macs(self, nic, macs):
+        # NetBox >= 4.x exposes MACAddress only via DCIM.
+        # There is no /api/virtualization/mac-addresses/ endpoint.
+        # Skip MAC object syncing for virtual machines to avoid hard failure.
+        if self.get_network_type() == "virtual":
+            logging.debug(
+                "Skipping MAC address object sync for virtual machine interface %s",
+                nic.name,
+            )
+            return
+
         nb_macs = list(self.nb_net.mac_addresses.filter(interface_id=nic.id))
         # Clean
         for nb_mac in nb_macs:
@@ -337,7 +364,25 @@ class Network(object):
         if nic.get("ethtool") and nic["ethtool"].get("link") == "no":
             params["enabled"] = False
 
-        interface = self.nb_net.interfaces.create(**params)
+        # avoid crashing patch #3
+        # interface = self.nb_net.interfaces.create(**params)
+        try:
+            interface = self.nb_net.interfaces.create(**params)
+        except Exception as exc:
+            msg = str(exc)
+            if "Interface with this Device and Name already exists" in msg:
+                logging.debug(
+                    "Interface %s already exists on device %s, re-fetching",
+                    nic["name"],
+                    self.device.name,
+                )
+                interface = self.nb_net.interfaces.get(
+                    device_id=self.device.id,
+                    name=nic["name"],
+                )
+            else:
+                raise
+
 
         if nic["vlan"]:
             nb_vlan = self.get_or_create_vlan(nic["vlan"])
