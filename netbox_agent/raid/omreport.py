@@ -17,8 +17,13 @@ def omreport(sub_command):
     p.wait()
     stdout = p.stdout.read().decode("utf-8")
     if p.returncode != 0:
-        mesg = "Failed to execute command '{}':\n{}".format(" ".join(command), stdout)
-        raise OmreportControllerError(mesg)
+        # OMSA / omreport is deprecated and EOL.
+        # Modern Dell servers should be managed via iDRAC / Redfish instead.
+        # Skip OMSA-based RAID collection to avoid noisy errors.
+        logging.debug("Skipping OMSA RAID collection (omreport deprecated)")
+        return []
+        #mesg = "Failed to execute command '{}':\n{}".format(" ".join(command), stdout)
+        #raise OmreportControllerError(mesg)
 
     res = {}
     section_re = re.compile("^[A-Z]")

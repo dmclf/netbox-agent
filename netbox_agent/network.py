@@ -596,7 +596,14 @@ class Network(object):
                 if version.parse(nb.version) < version.parse("4.2"):
                     interface.mac_address = nic["mac"]
                 else:
-                    interface.primary_mac_address = {"mac_address": nic["mac"]}
+                    # NetBox >= 4.2 requires primary_mac_address to resolve to a
+                    # single MACAddress object. Multiple MACAddress objects with
+                    # the same MAC may exist, so skip setting this field to avoid
+                    # a 400 error.
+                    logging.debug(
+                        "Skipping primary_mac_address update to avoid MACAddress ambiguity"
+                    )
+                    #interface.primary_mac_address = {"mac_address": nic["mac"]}
                 nic_update += 1
 
             if hasattr(interface, "mtu"):
