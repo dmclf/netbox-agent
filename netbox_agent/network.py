@@ -14,10 +14,20 @@ from netbox_agent.ethtool import Ethtool
 from netbox_agent.ipmi import IPMI
 from netbox_agent.lldp import LLDP
 
+
+from typing import Optional
+
 VIRTUAL_NET_FOLDER = Path("/sys/devices/virtual/net")
 
-
 class Network(object):
+    CISCO_INTERFACE_PREFIX_MAP = {
+        "Gi": "GigabitEthernet",
+        "Te": "TenGigabitEthernet",
+        "Fa": "FastEthernet",
+        "Eth": "Ethernet",        # NX‑OS shorthand
+        "Po": "Port-channel",
+    }
+
     def __init__(self, server, *args, **kwargs):
         self.nics = []
 
@@ -42,6 +52,38 @@ class Network(object):
             self.ipam_choices[key] = {}
             for choice in ipam_c[_choice_type]:
                 self.ipam_choices[key][choice["display_name"]] = choice["value"]
+
+
+    def _resolve_cisco_canonical_name(self, ifname: str) -> Optional[str]:
+        """
+        Convert Cisco short interface name (Gi2/0/11)
+        to canonical long form (GigabitEthernet2/0/11).
+        """
+        for short, long in self.CISCO_INTERFACE_PREFIX_MAP.items():
+            if ifname.startswith(short):
+                return ifname.replace(short, long, 1)
+        return None
+
+    def _get_or_create_tag(self, tag_name: str) -> int:
+        """
+        Resolve a NetBox tag by name, creating it if it does not exist.
+
+        Returns the tag ID.
+        """
+        tag = nb.extras.tags.get(name=tag_name)
+        if tag:
+            return tag.id
+
+        logging.info(
+            "Creating NetBox tag '%s' (required for LLDP auto-discovered interfaces)",
+            tag_name,
+        )
+
+        tag = nb.extras.tags.create(
+            name=tag_name,
+            slug=tag_name.replace("_", "-"),
+        )
+        return tag.id
 
     def get_network_type():
         return NotImplementedError
@@ -228,17 +270,78 @@ class Network(object):
         return self.dcim_choices["interface:type"]["Other"]
 
     def get_or_create_vlan(self, vlan_id):
-        # FIXME: we may need to specify the datacenter
-        # since users may have same vlan id in multiple dc
-        vlan = nb.ipam.vlans.get(
-            vid=vlan_id,
-        )
-        if vlan is None:
-            vlan = nb.ipam.vlans.create(
-                name="VLAN {}".format(vlan_id),
+        """
+        Resolve VLAN by VID with site-aware disambiguation.
+
+        Resolution order:
+        1. Single global match → use
+        2. Multiple matches → prefer VLAN with same site as device
+        3. If still ambiguous → log + skip
+        """
+
+        vlans = list(nb.ipam.vlans.filter(vid=vlan_id))
+
+        # Fast path: no existing VLANs → create unscoped VLAN
+        if not vlans:
+            return nb.ipam.vlans.create(
+                name=f"VLAN {vlan_id}",
                 vid=vlan_id,
             )
-        return vlan
+
+        # Fast path: exactly one VLAN → safe to use
+        if len(vlans) == 1:
+            return vlans[0]
+
+        # Try site-aware narrowing
+        site = getattr(self.device, "site", None)
+        if site:
+            site_vlans = [
+                v for v in vlans
+                if getattr(v, "site", None) and v.site.id == site.id
+            ]
+
+            if len(site_vlans) == 1:
+                logging.debug(
+                    "Resolved VLAN %s by site match (%s)",
+                    vlan_id,
+                    site.name,
+                )
+                return site_vlans[0]
+
+            if len(site_vlans) > 1:
+                logging.warning(
+                    "Multiple VLANs found with vid=%s in site %s; skipping VLAN assignment",
+                    vlan_id,
+                    site.name,
+                )
+                return None
+
+        # Still ambiguous or no site info
+        logging.warning(
+            "Multiple VLANs found with vid=%s and no unique site match; skipping VLAN assignment",
+            vlan_id,
+        )
+        return None
+        
+    # def get_or_create_vlan(self, vlan_id):
+    #     # VLAN VID is not globally unique in NetBox.
+    #     # Multiple VLANs may exist with the same VID across sites/groups.
+    #     vlans = list(nb.ipam.vlans.filter(vid=vlan_id))
+
+    #     if not vlans:
+    #         return nb.ipam.vlans.create(
+    #             name=f"VLAN {vlan_id}",
+    #             vid=vlan_id,
+    #         )
+
+    #     if len(vlans) == 1:
+    #         return vlans[0]
+
+    #     logging.warning(
+    #         "Multiple VLANs found with vid=%s; skipping VLAN assignment",
+    #         vlan_id,
+    #     )
+    #     return None
 
     def reset_vlan_on_interface(self, nic, interface):
         update = False
@@ -302,9 +405,19 @@ class Network(object):
                     "Resetting access VLAN on interface {interface}".format(interface=interface)
                 )
                 update = True
+                
                 nb_vlan = self.get_or_create_vlan(pvid_vlan[0])
+
+                if not nb_vlan:
+                    logging.debug(
+                        "Skipping access VLAN assignment due to ambiguous VLAN vid=%s",
+                        pvid_vlan[0],
+                    )
+                    return update, interface
+
                 interface.mode = self.dcim_choices["interface:mode"]["Access"]
                 interface.untagged_vlan = nb_vlan.id
+
         return update, interface
 
     def update_interface_macs(self, nic, macs):
@@ -727,15 +840,129 @@ class ServerNetwork(Network):
             )
             return nb_server_interface
 
-        switch_interface = self.lldp.get_switch_port(nb_server_interface.name)
+        # switch_interface = self.lldp.get_switch_port(nb_server_interface.name)
+        # nb_switch_interface = nb.dcim.interfaces.get(
+        #     device_id=nb_switch.id,
+        #     name=switch_interface,
+        # )
+        # if nb_switch_interface is None:
+        #     logging.error("Switch interface {} cannot be found".format(switch_interface))
+        #     return nb_server_interface
         nb_switch_interface = nb.dcim.interfaces.get(
             device_id=nb_switch.id,
             name=switch_interface,
         )
-        if nb_switch_interface is None:
-            logging.error("Switch interface {} cannot be found".format(switch_interface))
+
+        # if nb_switch_interface is None:
+        #     # Extra guard: ensure the remote device is actually a network switch
+        #     device_role = getattr(nb_switch.role, "slug", None)
+        #     device_type = getattr(nb_switch.device_type, "slug", None)
+
+        #     is_switch_like = any(
+        #         x in (device_role or "") or x in (device_type or "")
+        #         for x in ("switch", "tor", "leaf", "spine", "network")
+        #     )
+
+        #     if not is_switch_like:
+        #         logging.warning(
+        #             "LLDP reported interface %s on device %s, but the device does not "
+        #             "appear to be a switch (role=%s, type=%s); skipping auto-interface creation",
+        #             switch_interface,
+        #             nb_switch.name,
+        #             device_role,
+        #             device_type,
+        #         )
+        #         return nb_server_interface
+
+        #  --- Canonical-aware LLDP interface matching (Cisco-only, opt-in) ---
+        lldp_name = switch_interface
+        naming_mode = getattr(config.network, "lldp_interface_naming", "lldp")
+ 
+        canonical_name = None
+        # platform_slug = (
+        #     getattr(nb_switch.platform, "slug", "")
+        #     if nb_switch.platform else ""
+        # )
+
+        # # Cisco-only canonical resolution
+        # if (
+        #     naming_mode == "canonical"
+        #     and platform_slug.startswith("cisco")
+        # ):
+        #     canonical_name = self._resolve_cisco_canonical_name(lldp_name)
+
+        # 1. Try exact LLDP-reported name
+        platform_slug = ""
+        vendor_slug = ""
+
+        if nb_switch.platform:
+            platform_slug = nb_switch.platform.slug or ""
+
+        if nb_switch.device_type and nb_switch.device_type.manufacturer:
+            vendor_slug = nb_switch.device_type.manufacturer.slug or ""
+
+        is_cisco = (
+            platform_slug.startswith("cisco")
+            or vendor_slug == "cisco"
+        )
+
+        if naming_mode == "canonical" and is_cisco:
+            canonical_name = self._resolve_cisco_canonical_name(lldp_name)
+
+        nb_switch_interface = None
+
+        # 1. Try LLDP name
+        nb_switch_interface = nb.dcim.interfaces.get(
+            device_id=nb_switch.id,
+            name=lldp_name,
+        )
+
+        # 2. Try canonical long name if LLDP name not found
+        if not nb_switch_interface and canonical_name:
+            nb_switch_interface = nb.dcim.interfaces.get(
+                device_id=nb_switch.id,
+                name=canonical_name,
+            )
+            if nb_switch_interface:
+                logging.debug(
+                    "Matched LLDP interface %s to existing canonical interface %s",
+                    lldp_name,
+                    canonical_name,
+                )
+                return nb_switch_interface
+        # 3. Neither exists -> decide whether to create
+        if not getattr(config.network, "auto_create_switch_interfaces", False):
+            logging.error(
+                "Switch interface %s not found on device %s. "
+                "Auto-creation is DISABLED. "
+                "Enable network.auto_create_switch_interfaces to allow creation.",
+                lldp_name,
+                nb_switch.name,
+            )
             return nb_server_interface
 
+        # 4. Create NEW interface (prefer canonical long format if available)
+        new_name = canonical_name or lldp_name
+
+        logging.warning(
+            "Auto-creating switch interface %s on device %s (LLDP reported %s)",
+            new_name,
+            nb_switch.name,
+            lldp_name,
+        )
+
+        tag_id = self._get_or_create_tag("lldp-discovered")
+
+        nb_switch_interface = nb.dcim.interfaces.create(
+             device=nb_switch.id,
+             name=new_name,
+             type=self.dcim_choices["interface:type"]["Other"],
+             enabled=True,
+             description="Auto-created from LLDP discovery",
+             tags=[tag_id],
+        )
+
+        # pre-existing logic 
         logging.info(
             "Found interface {} on switch {}".format(
                 switch_interface,
@@ -768,10 +995,94 @@ class ServerNetwork(Network):
                 switch_ip, switch_interface, nb_server_interface
             )
         else:
-            nb_sw_int = nb_server_interface.cable.b_terminations[0]
+            # nb_sw_int = nb_server_interface.cable.b_terminations[0]
+            cable = nb.dcim.cables.get(nb_server_interface.cable.id)
+
+            a_terms = cable.a_terminations or []
+            b_terms = cable.b_terminations or []
+
+            # If cable is broken (one-sided), delete and recreate
+            if not a_terms or not b_terms:
+                logging.warning(
+                    "Detected broken cable %s on interface %s; deleting and recreating",
+                    cable.id,
+                    nb_server_interface.name,
+                )
+                cable.delete()
+                return update, nb_server_interface            
+
+
             nb_sw = nb_sw_int.device
-            nb_mgmt_int = nb.dcim.interfaces.get(device_id=nb_sw.id, mgmt_only=True)
-            nb_mgmt_ip = nb.ipam.ip_addresses.get(interface_id=nb_mgmt_int.id)
+
+            # nb_mgmt_int = nb.dcim.interfaces.get(device_id=nb_sw.id, mgmt_only=True)
+            mgmt_ints = list(
+                nb.dcim.interfaces.filter(
+                    device_id=nb_sw.id,
+                    mgmt_only=True,
+                )
+            )
+            if not mgmt_ints:
+                logging.error(
+                    "Switch %s has no management interfaces defined in NetBox",
+                    nb_sw.name,
+                )
+                return update, nb_server_interface
+            if len(mgmt_ints) > 1:
+                logging.warning(
+                    "Switch %s has multiple management interfaces (%s); "
+                    "skipping cable update due to ambiguity",
+                    nb_sw.name,
+                    ", ".join(i.name for i in mgmt_ints),
+                )
+                return update, nb_server_interface
+            nb_mgmt_int = mgmt_ints[0]
+
+            # nb_mgmt_ip = nb.ipam.ip_addresses.get(interface_id=nb_mgmt_int.id)
+            mgmt_ips = list(
+                nb.ipam.ip_addresses.filter(interface_id=nb_mgmt_int.id)
+            )
+
+            if not mgmt_ips:
+                logging.error(
+                    "Management interface %s on switch %s has no IP addresses",
+                    nb_mgmt_int.name,
+                    nb_sw.name,
+                )
+                return update, nb_server_interface
+
+            # if len(mgmt_ips) > 1:
+            #     logging.warning(
+            #         "Management interface %s on switch %s has multiple IP addresses (%s); "
+            #         "skipping cable update due to ambiguity",
+            #         nb_mgmt_int.name,
+            #         nb_sw.name,
+            #         ", ".join(ip.address for ip in mgmt_ips),
+            #     )
+            #     return update, nb_server_interface
+
+            if len(mgmt_ips) > 1:
+                if not getattr(
+                    config.network,
+                    "allow_cable_on_ambiguous_mgmt_ip",
+                    False,
+                ):
+                    logging.warning(
+                        "Management interface %s on switch %s has multiple IP addresses (%s); "
+                        "skipping cable update due to ambiguity",
+                        nb_mgmt_int.name,
+                        nb_sw.name,
+                        ", ".join(ip.address for ip in mgmt_ips),
+                    )
+                    return update, nb_server_interface
+
+                logging.info(
+                    "Proceeding with cable creation despite multiple management IPs "
+                    "on interface %s (opt-in enabled)",
+                    nb_mgmt_int.name,
+                )
+
+            nb_mgmt_ip = mgmt_ips[0]
+
             if nb_mgmt_ip is None:
                 logging.error(
                     "Switch {switch_ip} does not have IP on its management interface".format(

@@ -120,6 +120,32 @@ def get_config():
     )
     p.add_argument("--network.ipmi", default=True, help="Enable gathering IPMI information")
     p.add_argument("--network.lldp", help="Enable auto-cabling feature through LLDP infos")
+    p.add_argument("--network.allow_cable_on_ambiguous_mgmt_ip",
+    action="store_true",
+    default=False,
+    help=(
+        "Allow cabling to be created even when the switch management interface "
+        "has multiple IP addresses. "
+        )
+    )
+    p.add_argument(
+        "--network.lldp_interface_naming",
+        choices=("lldp", "canonical"),
+        default="lldp",
+        help=(
+            "How to name switch interfaces discovered via LLDP. "
+            "'lldp' = use LLDP-reported name (default). "
+            "'canonical' = prefer existing canonical long names on supported platforms (Cisco)."
+        ),
+    )
+    p.add_argument("--network.auto_create_switch_interfaces",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow netbox-agent to auto-create missing switch interfaces in NetBox "
+            "when discovered via LLDP (OPT-IN, disabled by default)"
+        ),
+    )
     p.add_argument(
         "--network.nic_id",
         choices=("name", "mac"),
