@@ -53,6 +53,15 @@ class Network(object):
             for choice in ipam_c[_choice_type]:
                 self.ipam_choices[key][choice["display_name"]] = choice["value"]
 
+    def _termination_interface_id(self, term):
+        """
+        Return interface ID if this termination represents a dcim.interface,
+        otherwise return None.
+        """
+        iface = getattr(term, "interface", None)
+        if iface:
+            return iface.id
+        return None
 
     def _resolve_cisco_canonical_name(self, ifname: str) -> Optional[str]:
         """
@@ -840,58 +849,15 @@ class ServerNetwork(Network):
             )
             return nb_server_interface
 
-        # switch_interface = self.lldp.get_switch_port(nb_server_interface.name)
-        # nb_switch_interface = nb.dcim.interfaces.get(
-        #     device_id=nb_switch.id,
-        #     name=switch_interface,
-        # )
-        # if nb_switch_interface is None:
-        #     logging.error("Switch interface {} cannot be found".format(switch_interface))
-        #     return nb_server_interface
         nb_switch_interface = nb.dcim.interfaces.get(
             device_id=nb_switch.id,
             name=switch_interface,
         )
 
-        # if nb_switch_interface is None:
-        #     # Extra guard: ensure the remote device is actually a network switch
-        #     device_role = getattr(nb_switch.role, "slug", None)
-        #     device_type = getattr(nb_switch.device_type, "slug", None)
-
-        #     is_switch_like = any(
-        #         x in (device_role or "") or x in (device_type or "")
-        #         for x in ("switch", "tor", "leaf", "spine", "network")
-        #     )
-
-        #     if not is_switch_like:
-        #         logging.warning(
-        #             "LLDP reported interface %s on device %s, but the device does not "
-        #             "appear to be a switch (role=%s, type=%s); skipping auto-interface creation",
-        #             switch_interface,
-        #             nb_switch.name,
-        #             device_role,
-        #             device_type,
-        #         )
-        #         return nb_server_interface
-
-        #  --- Canonical-aware LLDP interface matching (Cisco-only, opt-in) ---
         lldp_name = switch_interface
         naming_mode = getattr(config.network, "lldp_interface_naming", "lldp")
  
         canonical_name = None
-        # platform_slug = (
-        #     getattr(nb_switch.platform, "slug", "")
-        #     if nb_switch.platform else ""
-        # )
-
-        # # Cisco-only canonical resolution
-        # if (
-        #     naming_mode == "canonical"
-        #     and platform_slug.startswith("cisco")
-        # ):
-        #     canonical_name = self._resolve_cisco_canonical_name(lldp_name)
-
-        # 1. Try exact LLDP-reported name
         platform_slug = ""
         vendor_slug = ""
 
@@ -917,7 +883,12 @@ class ServerNetwork(Network):
             name=lldp_name,
         )
 
-        # 2. Try canonical long name if LLDP name not found
+        # Resolve switch interface
+        nb_switch_interface = nb.dcim.interfaces.get(
+            device_id=nb_switch.id,
+            name=lldp_name,
+        )
+
         if not nb_switch_interface and canonical_name:
             nb_switch_interface = nb.dcim.interfaces.get(
                 device_id=nb_switch.id,
@@ -929,46 +900,108 @@ class ServerNetwork(Network):
                     lldp_name,
                     canonical_name,
                 )
-                return nb_switch_interface
-        # 3. Neither exists -> decide whether to create
-        if not getattr(config.network, "auto_create_switch_interfaces", False):
-            logging.error(
-                "Switch interface %s not found on device %s. "
-                "Auto-creation is DISABLED. "
-                "Enable network.auto_create_switch_interfaces to allow creation.",
-                lldp_name,
+
+        # Create ONLY if still unresolved
+        if not nb_switch_interface:
+            if not getattr(config.network, "auto_create_switch_interfaces", False):
+                logging.error(
+                    "Switch interface %s not found on device %s and auto-creation is disabled",
+                    lldp_name,
+                    nb_switch.name,
+                )
+                return nb_server_interface
+
+            new_name = canonical_name or lldp_name
+
+            logging.warning(
+                "Auto-creating switch interface %s on device %s (LLDP reported %s)",
+                new_name,
                 nb_switch.name,
+                lldp_name,
             )
-            return nb_server_interface
 
-        # 4. Create NEW interface (prefer canonical long format if available)
-        new_name = canonical_name or lldp_name
+            tag_id = self._get_or_create_tag("lldp-discovered")
 
-        logging.warning(
-            "Auto-creating switch interface %s on device %s (LLDP reported %s)",
-            new_name,
-            nb_switch.name,
-            lldp_name,
-        )
+            nb_switch_interface = nb.dcim.interfaces.create(
+                device=nb_switch.id,
+                name=new_name,
+                type=self.dcim_choices["interface:type"]["Other"],
+                enabled=True,
+                description="Auto-created from LLDP discovery",
+                tags=[tag_id],
+            )
 
-        tag_id = self._get_or_create_tag("lldp-discovered")
-
-        nb_switch_interface = nb.dcim.interfaces.create(
-             device=nb_switch.id,
-             name=new_name,
-             type=self.dcim_choices["interface:type"]["Other"],
-             enabled=True,
-             description="Auto-created from LLDP discovery",
-             tags=[tag_id],
-        )
-
-        # pre-existing logic 
         logging.info(
             "Found interface {} on switch {}".format(
                 switch_interface,
                 switch_ip,
             )
         )
+        # make sure we dont have old cables half connected on server?
+        existing_cable = nb_server_interface.cable
+
+        if existing_cable:
+            cable = nb.dcim.cables.get(existing_cable.id)
+
+            terminations = (
+                (cable.a_terminations or []) +
+                (cable.b_terminations or [])
+            )
+
+            # Does this cable already connect to the correct switch port?
+            if any(
+                self._termination_interface_id(t) == nb_server_interface.id
+                for t in terminations
+            ) and any(
+                self._termination_interface_id(t) == nb_switch_interface.id
+                for t in terminations
+            ):
+                logging.info(
+                    "Interface %s already correctly cabled to %s",
+                    nb_server_interface.name,
+                    nb_switch_interface.name,
+                )
+                return update, nb_server_interface
+
+            # Otherwise, it is stale or half‑broken
+            logging.warning(
+                "Removing stale/half cable %s from %s before re‑cabling",
+                cable.id,
+                nb_server_interface.name,
+            )
+            cable.delete()
+        # --- Switch-side stale / half-cable cleanup ---
+        if nb_switch_interface.cable:
+            cable = nb.dcim.cables.get(nb_switch_interface.cable.id)
+
+            terminations = (
+                (cable.a_terminations or []) +
+                (cable.b_terminations or [])
+            )
+
+            # Already correctly connected?
+            if any(
+                self._termination_interface_id(t) == nb_server_interface.id
+                for t in terminations
+            ) and any(
+                self._termination_interface_id(t) == nb_switch_interface.id
+                for t in terminations
+            ):
+                logging.info(
+                    "Switch interface %s already correctly cabled to %s",
+                    nb_switch_interface.name,
+                    nb_server_interface.name,
+                )
+                return update, nb_server_interface
+
+            # Otherwise: stale or half cable
+            logging.warning(
+                "Removing stale/half cable %s from switch interface %s",
+                cable.id,
+                nb_switch_interface.name,
+            )
+            cable.delete()        
+        # end of cable uncabling
         cable = nb.dcim.cables.create(
             a_terminations=[
                 {"object_type": "dcim.interface", "object_id": nb_server_interface.id},
