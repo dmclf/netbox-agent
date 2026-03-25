@@ -822,6 +822,7 @@ class ServerNetwork(Network):
         return ipmi
 
     def connect_interface_to_switch(self, switch_ip, switch_interface, nb_server_interface):
+        nb_switch_interface = None
         logging.info(
             "Interface {} is not connected to switch, trying to connect..".format(
                 nb_server_interface.name
@@ -875,7 +876,6 @@ class ServerNetwork(Network):
         if naming_mode == "canonical" and is_cisco:
             canonical_name = self._resolve_cisco_canonical_name(lldp_name)
 
-        nb_switch_interface = None
 
         # 1. Try LLDP name
         nb_switch_interface = nb.dcim.interfaces.get(
@@ -1020,129 +1020,36 @@ class ServerNetwork(Network):
         )
         return nb_server_interface
 
+
     def create_or_update_cable(self, switch_ip, switch_interface, nb_server_interface):
         update = False
+
+        # No cable from server side → delegate to switch logic
         if nb_server_interface.cable is None:
             update = True
             nb_server_interface = self.connect_interface_to_switch(
                 switch_ip, switch_interface, nb_server_interface
             )
-        else:
-            # nb_sw_int = nb_server_interface.cable.b_terminations[0]
-            cable = nb.dcim.cables.get(nb_server_interface.cable.id)
+            return update, nb_server_interface
 
-            a_terms = cable.a_terminations or []
-            b_terms = cable.b_terminations or []
+        # Cable exists → validate server-side only
+        cable = nb.dcim.cables.get(nb_server_interface.cable.id)
 
-            # If cable is broken (one-sided), delete and recreate
-            if not a_terms or not b_terms:
-                logging.warning(
-                    "Detected broken cable %s on interface %s; deleting and recreating",
-                    cable.id,
-                    nb_server_interface.name,
-                )
-                cable.delete()
-                return update, nb_server_interface            
+        a_terms = cable.a_terminations or []
+        b_terms = cable.b_terminations or []
 
-
-            nb_sw = nb_sw_int.device
-
-            # nb_mgmt_int = nb.dcim.interfaces.get(device_id=nb_sw.id, mgmt_only=True)
-            mgmt_ints = list(
-                nb.dcim.interfaces.filter(
-                    device_id=nb_sw.id,
-                    mgmt_only=True,
-                )
+        # Broken / half cable → delete and retry next run
+        if not a_terms or not b_terms:
+            logging.warning(
+                "Detected broken cable %s on interface %s; deleting and recreating",
+                cable.id,
+                nb_server_interface.name,
             )
-            if not mgmt_ints:
-                logging.error(
-                    "Switch %s has no management interfaces defined in NetBox",
-                    nb_sw.name,
-                )
-                return update, nb_server_interface
-            if len(mgmt_ints) > 1:
-                logging.warning(
-                    "Switch %s has multiple management interfaces (%s); "
-                    "skipping cable update due to ambiguity",
-                    nb_sw.name,
-                    ", ".join(i.name for i in mgmt_ints),
-                )
-                return update, nb_server_interface
-            nb_mgmt_int = mgmt_ints[0]
+            cable.delete()
+            return True, nb_server_interface
 
-            # nb_mgmt_ip = nb.ipam.ip_addresses.get(interface_id=nb_mgmt_int.id)
-            mgmt_ips = list(
-                nb.ipam.ip_addresses.filter(interface_id=nb_mgmt_int.id)
-            )
-
-            if not mgmt_ips:
-                logging.error(
-                    "Management interface %s on switch %s has no IP addresses",
-                    nb_mgmt_int.name,
-                    nb_sw.name,
-                )
-                return update, nb_server_interface
-
-            # if len(mgmt_ips) > 1:
-            #     logging.warning(
-            #         "Management interface %s on switch %s has multiple IP addresses (%s); "
-            #         "skipping cable update due to ambiguity",
-            #         nb_mgmt_int.name,
-            #         nb_sw.name,
-            #         ", ".join(ip.address for ip in mgmt_ips),
-            #     )
-            #     return update, nb_server_interface
-
-            if len(mgmt_ips) > 1:
-                if not getattr(
-                    config.network,
-                    "allow_cable_on_ambiguous_mgmt_ip",
-                    False,
-                ):
-                    logging.warning(
-                        "Management interface %s on switch %s has multiple IP addresses (%s); "
-                        "skipping cable update due to ambiguity",
-                        nb_mgmt_int.name,
-                        nb_sw.name,
-                        ", ".join(ip.address for ip in mgmt_ips),
-                    )
-                    return update, nb_server_interface
-
-                logging.info(
-                    "Proceeding with cable creation despite multiple management IPs "
-                    "on interface %s (opt-in enabled)",
-                    nb_mgmt_int.name,
-                )
-
-            nb_mgmt_ip = mgmt_ips[0]
-
-            if nb_mgmt_ip is None:
-                logging.error(
-                    "Switch {switch_ip} does not have IP on its management interface".format(
-                        switch_ip=switch_ip,
-                    )
-                )
-                return update, nb_server_interface
-
-            # Netbox IP is always IP/Netmask
-            nb_mgmt_ip = nb_mgmt_ip.address.split("/")[0]
-            if nb_mgmt_ip != switch_ip or nb_sw_int.name != switch_interface:
-                logging.info("Netbox cable is not connected to correct ports, fixing..")
-                logging.info(
-                    "Deleting cable {cable_id} from {interface} to {switch_interface} of "
-                    "{switch_ip}".format(
-                        cable_id=nb_server_interface.cable.id,
-                        interface=nb_server_interface.name,
-                        switch_interface=nb_sw_int.name,
-                        switch_ip=nb_mgmt_ip,
-                    )
-                )
-                cable = nb.dcim.cables.get(nb_server_interface.cable.id)
-                cable.delete()
-                update = True
-                nb_server_interface = self.connect_interface_to_switch(
-                    switch_ip, switch_interface, nb_server_interface
-                )
+        # Otherwise: cable exists and is not broken.
+        # Switch-side correctness is handled inside connect_interface_to_switch().
         return update, nb_server_interface
 
 
