@@ -27,6 +27,11 @@ class Network(object):
         "Eth": "Ethernet",        # NX‑OS shorthand
         "Po": "Port-channel",
     }
+    CISCO_CANONICAL_TYPE_MAP = {
+    "GigabitEthernet": "1000BASE-T (1GE)",
+    "TenGigabitEthernet": "10GBASE-T (10GE)",
+    }
+
 
     def __init__(self, server, *args, **kwargs):
         self.nics = []
@@ -52,6 +57,19 @@ class Network(object):
             self.ipam_choices[key] = {}
             for choice in ipam_c[_choice_type]:
                 self.ipam_choices[key][choice["display_name"]] = choice["value"]
+
+
+    def _infer_cisco_interface_type_from_name(self, ifname: str):
+        """
+        Best-effort, non-destructive inference of NetBox interface type
+        from canonical Cisco interface names.
+
+        Returns a NetBox interface type value, or None.
+        """
+        for prefix, type_label in self.CISCO_CANONICAL_TYPE_MAP.items():
+            if ifname.startswith(prefix):
+                return self.dcim_choices["interface:type"].get(type_label)
+        return None
 
     def _termination_interface_id(self, term):
         """
@@ -922,10 +940,27 @@ class ServerNetwork(Network):
 
             tag_id = self._get_or_create_tag("lldp-discovered")
 
+            # Default to safe fallback
+            interface_type = self.dcim_choices["interface:type"]["Other"]
+
+            # Infer type only in canonical mode and only for Cisco
+            if (
+                getattr(config.network, "lldp_interface_naming", "lldp") == "canonical"
+                and is_cisco
+            ):
+                inferred = self._infer_cisco_interface_type_from_name(new_name)
+                if inferred:
+                    interface_type = inferred
+                    logging.debug(
+                        "Inferred interface type '%s' for %s from canonical name",
+                        inferred,
+                        new_name,
+                    )
+
             nb_switch_interface = nb.dcim.interfaces.create(
                 device=nb_switch.id,
                 name=new_name,
-                type=self.dcim_choices["interface:type"]["Other"],
+                type=interface_type,
                 enabled=True,
                 description="Auto-created from LLDP discovery",
                 tags=[tag_id],
